@@ -52,6 +52,10 @@ function FullFat(conf) {
   this.since = 0
   this.follow = null
 
+  // set to true to log missing attachments only.
+  // otherwise, emits an error.
+  this.missingLog = conf.missing_log || false
+
   this.whitelist = conf.whitelist || [ /.*/ ]
 
   this.tmp = conf.tmp
@@ -168,9 +172,16 @@ FullFat.prototype.ongetdoc = function(change, er, data, res) {
     change.doc = data
     if (change.id.match(/^_design\//))
       this.putDesign(change)
+    else if (data.time && data.time.unpublished)
+      this.unpublish(change)
     else
       this.putDoc(change)
   }
+}
+
+FullFat.prototype.unpublish = function(change) {
+  change.fat = change.doc
+  this.put(change, [])
 }
 
 FullFat.prototype.putDoc = function(change) {
@@ -306,6 +317,7 @@ FullFat.prototype.merge = function(change) {
     var tgz = s.versions[v].dist.tarball
     var att = path.basename(url.parse(tgz).pathname)
     var ver = s.versions[v]
+    f.versions = f.versions || {}
 
     if (!f.versions[v] || f.versions[v].dist.shasum !== ver.dist.shasum) {
       f.versions[v] = s.versions[v]
@@ -517,7 +529,7 @@ FullFat.prototype.fetchAll = function(change, need, did) {
 
 FullFat.prototype.fetchOne = function(change, need, did, v) {
   var f = change.fat
-  var r = url.parse(f.versions[v].dist.tarball)
+  var r = url.parse(change.doc.versions[v].dist.tarball)
   if (this.registry) {
     var p = '/' + change.id + '/-/' + path.basename(r.pathname)
     r = url.parse(this.registry + p)
@@ -531,13 +543,13 @@ FullFat.prototype.fetchOne = function(change, need, did, v) {
 
   var req = hh.request(r)
   req.on('error', this.emit.bind(this, 'error', 'fetch one ' + change.id + ' ' + r.pathname))
-  req.on('response', this.onattres.bind(this, change, need, did, v))
+  req.on('response', this.onattres.bind(this, change, need, did, v, r))
   req.end()
 }
 
-FullFat.prototype.onattres = function(change, need, did, v, res) {
+FullFat.prototype.onattres = function(change, need, did, v, r, res) {
   var f = change.fat
-  var att = f.versions[v].dist.tarball
+  var att = r.href
   var sum = f.versions[v].dist.shasum
   var filename = f.name + '-' + v + '.tgz'
   var file = path.join(this.tmp, change.id + '-' + change.seq, filename)
@@ -565,8 +577,15 @@ FullFat.prototype.onattres = function(change, need, did, v, res) {
   // if the attachment can't be found, then skip that version
   // it's uninstallable as of right now, and may or may not get
   // fixed in a future update
-  if (res.statusCode !== 200)
-    return skip()
+  if (res.statusCode !== 200) {
+    var er = new Error('Error fetching attachment: ' + att)
+    er.statusCode = res.statusCode
+    er.code = 'attachment-fetch-fail'
+    if (this.missingLog)
+      return fs.appendFile(this.missingLog, att + '\n', skip)
+    else
+      return this.emit('error', er)
+  }
 
   var fstr = fs.createWriteStream(file)
 
